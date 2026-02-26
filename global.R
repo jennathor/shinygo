@@ -32,17 +32,43 @@ if (nchar(datapath) == 0) {
 }
 # Add version
 datapath <<- paste0(datapath, "/", db_ver, "/")
-org_info_file <<- paste0(datapath, "demo/orgInfo.db")
+
+# For local development, use convertIDs.db which contains orgInfo table
+org_info_file <<- paste0(datapath, "convertIDs.db")
 if (!file.exists(org_info_file)) {
-  datapath <<- paste0("./", db_ver, "/")
+  # Try demo/orgInfo.db path (for production deployment)
   org_info_file <<- paste0(datapath, "demo/orgInfo.db")
+  if (!file.exists(org_info_file)) {
+    # Try alternate path with version
+    datapath <<- paste0("./", db_ver, "/")
+    org_info_file <<- paste0(datapath, "demo/orgInfo.db")
+  }
 }
 
-connect_convert_db <- function(datapath = datapath) {
+connect_convert_db <- function(datapath = datapath, session = NULL) {
   if (!file.exists(org_info_file)) {
     # download org_info and demo files to current folder
-    withProgress(message = "Download demo data and species database", {
-      incProgress(0.2)
+    # Check if we're in a Shiny session context
+    in_shiny_session <- !is.null(session) || (!is.null(shiny::getDefaultReactiveDomain()))
+
+    if (in_shiny_session) {
+      # Use withProgress if in a Shiny session
+      withProgress(message = "Download demo data and species database", {
+        incProgress(0.2)
+        file_name <- paste0(db_ver, ".tar.gz")
+        options(timeout = 300)
+        download.file(
+          url = paste0(db_url, db_ver, "/", file_name),
+          destfile = file_name,
+          mode = "wb",
+          quiet = FALSE
+        )
+        untar(file_name) # untar and unzip the files
+        file.remove(file_name) # delete the tar file to save storage
+      })
+    } else {
+      # Use regular messages if called during initialization
+      cat("Downloading demo data and species database...\n")
       file_name <- paste0(db_ver, ".tar.gz")
       options(timeout = 300)
       download.file(
@@ -51,9 +77,11 @@ connect_convert_db <- function(datapath = datapath) {
         mode = "wb",
         quiet = FALSE
       )
+      cat("Extracting files...\n")
       untar(file_name) # untar and unzip the files
       file.remove(file_name) # delete the tar file to save storage
-    })
+      cat("Done!\n")
+    }
   }
 
   return(DBI::dbConnect(
@@ -80,7 +108,7 @@ minGenes <- 10 # min number of genes for plotting
 PvalGeneInfo1 <- 0.01
 PvalGeneInfo2 <- 0.001
 maxGenesBackground <- 100000
-redudantGeneSetsRatio <- 0.95 # remove redundant pathways if they share 90% of genes.
+redundantGeneSetsRatio <- 0.95 # remove redundant pathways if they share 90% of genes.
 min_gene_fold <- 10 # minimum number of  genes in pathways, when sorting by fold.
 pdf(NULL) # this prevents error Cannot open file 'Rplots.pdf'
 ExampleGeneList2 <-
@@ -208,15 +236,6 @@ draw_key_polygon3 <- function(data, params, size) {
 # register new key drawing function,
 # the effect is global & persistent throughout the R session
 GeomBar$draw_key <- draw_key_polygon3
-
-# find peak values in density plots
-# for adding annotation texts
-# http://ianmadd.github.io/pages/PeakDensityDistribution.html
-densMode <- function(x) {
-  td <- density(x, na.rm = TRUE)
-  maxDens <- which.max(td$y)
-  list(x = td$x[maxDens], y = td$y[maxDens])
-}
 
 cleanGeneSet <- function(x) {
   # remove duplicate; upper case; remove special characters
@@ -350,11 +369,20 @@ columnSelection <- list(
 #' @return Database connection.
 connect_convert_db_org <- function(datapath = datapath, select_org) {
   ix <- which(orgInfo$id == select_org)
-  db_file <- orgInfo[ix, "file"]
+  # Construct filename from species name if 'file' column doesn't exist
+  if ("file" %in% colnames(orgInfo)) {
+    db_file <- orgInfo[ix, "file"]
+  } else {
+    # Use name column and add .db extension
+    db_file <- paste0(orgInfo[ix, "name"], ".db")
+  }
+
+  db_path <- paste0(datapath, "db/", db_file)
+
   return(try(
     DBI::dbConnect(
       drv = RSQLite::dbDriver("SQLite"),
-      dbname = paste0(datapath, "db/", db_file),
+      dbname = db_path,
       flags = RSQLite::SQLITE_RO
     )
   ))
@@ -363,7 +391,12 @@ connect_convert_db_org <- function(datapath = datapath, select_org) {
 
 # keggSpeciesID = read.csv(paste0(datapath,"data_go/KEGG_Species_ID.csv"))
 # List of GMT files in /gmt sub folder
-gmtFiles <- orgInfo$file
+# Construct filenames from species name if 'file' column doesn't exist
+if ("file" %in% colnames(orgInfo)) {
+  gmtFiles <- orgInfo$file
+} else {
+  gmtFiles <- paste0(orgInfo$name, ".db")
+}
 gmtFiles <- paste(datapath, "/db/", gmtFiles, sep = "")
 # geneInfoFiles <- list.files(path = paste0(datapath, "geneInfo"), pattern = ".*GeneInfo\\.csv")
 # geneInfoFiles <- paste(datapath, "geneInfo/", geneInfoFiles, sep = "")
@@ -672,8 +705,8 @@ FindOverlap <- function(converted, gInfo, GO, selectOrg, convertedB = NULL, gInf
     return(idNotRecognized)
   }
 
-  ix <- grep(converted$species[1, 1], gmtFiles)
-  totalGenes <- converted$species[1, 7]
+  ix <- grep(converted$species$name[1], gmtFiles)
+  totalGenes <- converted$species$genes[1]
 
   errorMessage <- list(
     x = as.data.frame("Annotation file cannot be found"),
@@ -685,11 +718,11 @@ FindOverlap <- function(converted, gInfo, GO, selectOrg, convertedB = NULL, gInf
 
   # If selected species is not the default "bestMatch", use that species directly
   if (selectOrg != speciesChoice[[1]]) {
-    ix <- grep(findSpeciesById(selectOrg)[1, 1], gmtFiles)
+    ix <- grep(findSpeciesById(selectOrg)$name[1], gmtFiles)
     if (length(ix) == 0) {
       return(idNotRecognized)
     }
-    totalGenes <- orgInfo[which(orgInfo$id == as.numeric(selectOrg)), 7]
+    totalGenes <- orgInfo[which(orgInfo$id == as.numeric(selectOrg)), "genes"]
   }
   pathway <- dbConnect(sqlite, gmtFiles[ix], flags = SQLITE_RO)
 
@@ -949,11 +982,11 @@ promoter <- function(converted, selectOrg, radio) {
   if (length(querySet) == 0) {
     return(idNotRecognized)
   }
-  ix <- grep(converted$species[1, 1], motifFiles)
+  ix <- grep(converted$species$name[1], motifFiles)
 
   # If selected species is not the default "bestMatch", use that species directly
   if (selectOrg != speciesChoice[[1]]) {
-    ix <- grep(findSpeciesById(selectOrg)[1, 1], motifFiles)
+    ix <- grep(findSpeciesById(selectOrg)$name[1], motifFiles)
   }
 
   ix1 <- grep(as.character(radio), motifFiles[ix]) # match 300bp or 600bp
@@ -1264,75 +1297,20 @@ enrichmentNetwork <- function(enrichedTerms, layoutButton = 0, edge.cutoff = 5) 
   )
 }
 
-keggSpeciesID <- orgInfo[, c("ensembl_dataset", "name", "KEGG")]
-colnames(keggSpeciesID)[3] <- "kegg"
-
-
-
-convertEnsembl2Entrez <- function(query, Species) {
-  speciesID <- orgInfo$id[which(orgInfo$ensembl_dataset == Species)] # note uses species Identifying
-  # connect to the database, this becomes a global variable
-  convert_species <- connect_convert_db_org(datapath, speciesID)
-  # finds id index corresponding to entrez gene and KEGG for id conversion
-  idType_Entrez <- dbGetQuery(convert_species, paste("select distinct * from idIndex where idType = 'entrezgene_id'"))
-  if (dim(idType_Entrez)[1] != 1) {
-    cat("Warning! entrezgene ID not found!")
-  }
-  idType_Entrez <- as.numeric(idType_Entrez[1, 1])
-
-  # given a set of ensembl ids, return a mapping table to Entrez gene ID
-  querySet <- cleanGeneSet(unlist(strsplit(toupper(query), "\t| |\n|\\,")))
-
-  result <- dbGetQuery(
-    convert_species,
-    paste0(
-      " SELECT  id,ens from mapping where idType ='", idType_Entrez, "'",
-      " AND ens IN ('", paste(querySet, collapse = "', '"), "')"
-    )
-  )
-  dbDisconnect(convert_species)
-
-  if (dim(result)[1] == 0) {
-    return(NULL)
-  }
-
-  colnames(result) <- c("entrezgene_id", "ensembl_gene_id")
-
-  return(result)
+# Check if KEGG column exists in orgInfo
+if ("KEGG" %in% colnames(orgInfo)) {
+  keggSpeciesID <- orgInfo[, c("ensembl_dataset", "name", "KEGG")]
+  colnames(keggSpeciesID)[3] <- "kegg"
+} else {
+  # For local development without KEGG column, create placeholder
+  keggSpeciesID <- orgInfo[, c("ensembl_dataset", "name")]
+  keggSpeciesID$kegg <- "" # Empty KEGG IDs
+  cat("Note: KEGG column not found in database. KEGG pathways may not work.\n")
 }
 
-# Given a KEGG pathway description, found pathway ids
-keggPathwayID <- function(pathwayDescription, Species, GO, selectOrg) {
-  ix <- grep(Species, gmtFiles)
 
-  if (length(ix) == 0) {
-    return(NULL)
-  }
 
-  # If selected species is not the default "bestMatch", use that species directly
-  if (selectOrg != speciesChoice[[1]]) {
-    ix <- grep(findSpeciesById(selectOrg)[1, 1], gmtFiles)
-    if (length(ix) == 0) {
-      return(NULL)
-    }
-    totalGenes <- orgInfo[which(orgInfo$id == as.numeric(selectOrg)), 7]
-  }
-  pathway <- dbConnect(sqlite, gmtFiles[ix], flags = SQLITE_RO)
-
-  # change Parkinson's disease to Parkinson\'s disease    otherwise SQL
-  pathwayDescription <- gsub("\'", "\'\'", pathwayDescription)
-
-  pathwayInfo <- dbGetQuery(pathway, paste(" select * from pathwayInfo where description =  '",
-    pathwayDescription, "' AND name LIKE '", GO, "%'",
-    sep = ""
-  ))
-  dbDisconnect(pathway)
-  if (dim(pathwayInfo)[1] != 1) {
-    return(NULL)
-  }
-  tem <- gsub(".*:", "", pathwayInfo[1, 2])
-  return(gsub("_.*", "", tem))
-}
+# convertEnsembl2Entrez() and keggPathwayID() have been moved to R/fct_06_kegg.R
 
 # not working, for updating GO cateory choices
 gmtCategory <- function(converted, selectOrg) {
@@ -1344,14 +1322,14 @@ gmtCategory <- function(converted, selectOrg) {
   if (length(querySet) == 0) {
     return(idNotRecognized)
   }
-  ix <- grep(converted$species[1, 1], gmtFiles)
+  ix <- grep(converted$species$name[1], gmtFiles)
   if (length(ix) == 0) {
     return(idNotRecognized)
   }
 
   # If selected species is not the default "bestMatch", use that species directly
   if (selectOrg != speciesChoice[[1]]) {
-    ix <- grep(findSpeciesById(selectOrg)[1, 1], gmtFiles)
+    ix <- grep(findSpeciesById(selectOrg)$name[1], gmtFiles)
     if (length(ix) == 0) {
       return(idNotRecognized)
     }
@@ -1612,71 +1590,6 @@ mod_download_images_server <- function(id, filename, figure, width = 8, height =
 # mod_download_images_server("download_images_ui_1")
 
 
-#' Change ggplot2 plots
-#'
-#'
-#' @param p ggplot2 object
-#' @param gridline TRUE of FALSE
-#'
-#' @export
-#' @return ggplot2 object
-refine_ggplot2 <- function(p, gridline, ggplot2_theme = "light") {
-
-  # apply theme based on selection
-  p <- switch(ggplot2_theme,
-    "linedraw" = p + ggplot2::theme_linedraw(),
-    "classic" = p + ggplot2::theme_classic(),
-    "gray" = p + ggplot2::theme_gray(),
-    "light" = p + ggplot2::theme_light(),
-    "dark" = p + ggplot2::theme_dark(),
-    "bw" = p + ggplot2::theme_bw(),
-    p # default, no change
-  )
-
-  if (ggplot2_theme != "Add grid") { # keep grid
-    if (!gridline) { # by default it has gridlines
-      p <- p +
-        ggplot2::theme(panel.grid = ggplot2::element_blank())
-    }
-  }
-
-  return(p)
-}
-
-# generates a fake ggplot2, with some message like: "Not available."
-fake_plot <- function(some_text) {
-  p <- ggplot2::ggplot() +
-    geom_point() +
-    xlim(-10, 10) +
-    ylim(-10, 10) +
-    annotate("text",
-      x = 0,
-      y = 0,
-      label = some_text
-    ) +
-    theme(
-      legend.position = "none",
-      panel.grid = element_blank(),
-      axis.title = element_blank(),
-      axis.text = element_blank(),
-      axis.ticks = element_blank()
-    )
-  return(p)
-}
-
-# 0.000234   <- 2.3E-4 *
-mark_significance <- function(Pval, PvalGeneInfo2, PvalGeneInfo1, PvalGeneInfo) {
-  sig <- paste("P=", formatC(Pval, digits = 2, format = "G"), sep = "")
-  if (Pval < PvalGeneInfo2) {
-    sig <- paste(sig, "***")
-  } else
-  if (Pval < PvalGeneInfo1) {
-    sig <- paste(sig, "**")
-  } else
-  if (Pval < PvalGeneInfo) sig <- paste(sig, "*")
-  return(sig)
-}
-
 #' Find a species by ID
 #'
 #' Find a species in the iDEP database with an
@@ -1705,21 +1618,6 @@ find_species_by_id_name <- function(species_id, org_info) {
 find_species_id_by_ensembl <- function(ensembl_dataset, org_info) {
   # find species name use id
   return(org_info[which(org_info$ensembl_dataset == ensembl_dataset), "id"])
-}
-
-#' Find taxon ID by species ID
-#'
-#' Find a species in the iDEP database with an
-#' ID.
-#'
-#' @param species_id Species ID to search the database with
-#' @param org_info iDEP data org_info file
-#'
-#' @export
-#' @return Only return the species name with this function.
-find_taxon_by_id <- function(species_id, org_info) {
-  # find species name use id
-  return(org_info[which(org_info$id == species_id), "taxon_id"])
 }
 
 #' Remove Pathway ID from pathway name
